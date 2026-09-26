@@ -1,0 +1,117 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+
+// ===== 修改为你的信息 =====
+const char* ssid       = "你的WiFi名称";
+const char* password   = "你的WiFi密码";
+const char* serverHost = "192.168.1.100";   // Flask 服务器 IP
+const int   serverPort = 5000;
+const int   DEVICE_ID  = 1;                 // 每台改 1~9
+
+// ===== 按钮引脚 =====
+const int countPin = 0;   // GPIO0
+const int resetPin = 1;   // GPIO1
+
+// ===== 防抖变量 =====
+int lastCountState = HIGH;
+int lastResetState = HIGH;
+unsigned long lastCountDebounce = 0;
+unsigned long lastResetDebounce = 0;
+const unsigned long debounceDelay = 50; // 防抖时间(ms)
+
+// ===== 事件队列变量 =====
+// 0 = 无事件, 1 = 计数, 2 = 重置
+volatile int pendingEvent = 0; 
+
+// ===== 独立的网络发送任务 (运行在 Core 0 或 Core 1) =====
+void networkTask(void * parameter) {
+  for(;;) {
+    if (pendingEvent != 0) {
+      int event = pendingEvent;
+      pendingEvent = 0; // 清除事件
+      
+      if (WiFi.status() == WL_CONNECTED) {
+        HTTPClient http;
+        String url = "http://" + String(serverHost) + ":" + String(serverPort);
+        
+        if (event == 1) {
+          url += "/report/" + String(DEVICE_ID);
+          http.begin(url);
+          int code = http.GET();
+          Serial.printf("[网络任务] 上报: HTTP %d\n", code);
+          http.end();
+        } 
+        else if (event == 2) {
+          url += "/reset_device/" + String(DEVICE_ID);
+          http.begin(url);
+          int code = http.POST("");
+          Serial.printf("[网络任务] 重置: HTTP %d\n", code);
+          http.end();
+        }
+      } else {
+        Serial.println("[网络任务] WiFi 未连接，丢弃事件");
+      }
+    }
+    vTaskDelay(10 / portTICK_PERIOD_MS); // 讓出 CPU 時間
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("\n=== ESP32-C3 Counter Starting ===");
+  Serial.printf("Device ID: %d\n", DEVICE_ID);
+
+  pinMode(countPin, INPUT_PULLUP);
+  pinMode(resetPin, INPUT_PULLUP);
+
+  // 连接 Wi-Fi
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  Serial.print("连接 Wi-Fi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWi-Fi 已连接，IP: " + WiFi.localIP().toString());
+
+  // 建立独立的网络任务 (在核心 0 上运行，避免影响主循环)
+  xTaskCreatePinnedToCore(
+    networkTask,   // 任务函数
+    "NetworkTask", // 任务名称
+    10000,         // 堆栈大小
+    NULL,          // 参数
+    1,             // 优先级
+    NULL,          // 任务句柄
+    0              // 运行在 Core 0
+  );
+}
+
+void loop() {
+  // 若 Wi-Fi 断线自动重连 (放在 loop 中可能会阻塞，但保留作为保险)
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Wi-Fi 断线，重连中...");
+    WiFi.reconnect();
+    delay(500);
+  }
+
+  // ---- 计数按钮 (GPIO0) ----
+  int countReading = digitalRead(countPin);
+  if (countReading == LOW && lastCountState == HIGH && (millis() - lastCountDebounce > debounceDelay)) {
+    lastCountDebounce = millis();
+    Serial.println("计数按钮按下 -> 加入队列");
+    pendingEvent = 1; // 通知网络任务发送
+  }
+  lastCountState = countReading;
+
+  // ---- 重置按钮 (GPIO1) ----
+  int resetReading = digitalRead(resetPin);
+  if (resetReading == LOW && lastResetState == HIGH && (millis() - lastResetDebounce > debounceDelay)) {
+    lastResetDebounce = millis();
+    Serial.println("重置按钮按下 -> 加入队列");
+    pendingEvent = 2; // 通知网络任务发送
+  }
+  lastResetState = resetReading;
+
+  delay(5); // 极短的循环延迟，保证按钮检测灵敏度
+}
