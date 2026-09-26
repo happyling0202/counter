@@ -1,1 +1,1 @@
-# counter (vibe coding)
+# wifi counter (vibe coding)
